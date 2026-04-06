@@ -233,7 +233,7 @@ letta:
 # =============================================================================
 model:
   # Global settings
-  global_max_context_window_limit: 32000
+  global_max_context_window_limit: 128000
   inner_thoughts_kwarg: thinking
   default_prompt_formatter: chatml
 
@@ -260,6 +260,7 @@ model:
     base_url: https://generativelanguage.googleapis.com/
     force_minimum_thinking_budget: false
     max_retries: 5
+    timeout_seconds: 600.0
 
   # Google Vertex (-> GOOGLE_CLOUD_*)
   # google_cloud:

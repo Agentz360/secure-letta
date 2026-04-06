@@ -37,6 +37,7 @@ from letta.schemas.letta_message_content import (
 )
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import ApprovalCreate, Message, MessageCreate, ToolReturn
+from letta.schemas.provider_trace import BillingContext
 from letta.schemas.tool_execution_result import ToolExecutionResult
 from letta.schemas.usage import LettaUsageStatistics
 from letta.schemas.user import User
@@ -364,6 +365,8 @@ def create_approval_request_message_from_llm_response(
     )
     if pre_computed_assistant_message_id:
         approval_message.id = decrement_message_uuid(pre_computed_assistant_message_id)
+    # Set otid to match streaming interface pattern (index -1 returns id unchanged)
+    approval_message.otid = Message.generate_otid_from_id(approval_message.id, -1)
     messages.append(approval_message)
     return messages
 
@@ -421,7 +424,7 @@ def create_letta_messages_from_llm_response(
             content = []
             if reasoning_content:
                 for content_part in reasoning_content:
-                    if isinstance(content_part, TextContent) and content_part.text == "":
+                    if isinstance(content_part, TextContent) and content_part.text == "" and content_part.signature is None:
                         continue
                     content.append(content_part)
 
@@ -441,7 +444,7 @@ def create_letta_messages_from_llm_response(
             content = []
             if reasoning_content:
                 for content_part in reasoning_content:
-                    if isinstance(content_part, TextContent) and content_part.text == "":
+                    if isinstance(content_part, TextContent) and content_part.text == "" and content_part.signature is None:
                         continue
                     content.append(content_part)
 
@@ -569,7 +572,7 @@ def create_parallel_tool_messages_from_llm_response(
         ] = []
         if reasoning_content:
             for content_part in reasoning_content:
-                if isinstance(content_part, TextContent) and content_part.text == "":
+                if isinstance(content_part, TextContent) and content_part.text == "" and content_part.signature is None:
                     continue
                 content.append(content_part)
 
@@ -799,6 +802,7 @@ async def capture_and_persist_messages(
     user_messages: list[str],
     assistant_message: str,
     model: Optional[str] = None,
+    billing_context: BillingContext | None = None,
 ) -> Dict[str, Any]:
     """
     Capture user and assistant messages and persist them to the database.
@@ -860,7 +864,7 @@ async def capture_and_persist_messages(
 
             sleeptime_agent_loop = SleeptimeMultiAgentV4(agent_state=agent, actor=actor, group=sleeptime_group)
             sleeptime_agent_loop.response_messages = response_messages
-            run_ids = await sleeptime_agent_loop.run_sleeptime_agents()
+            run_ids = await sleeptime_agent_loop.run_sleeptime_agents(billing_context=billing_context)
             logger.info(f"Triggered sleeptime agents, run_ids: {run_ids}")
 
     except Exception as e:

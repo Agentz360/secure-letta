@@ -51,6 +51,7 @@ class SimpleLLMRequestAdapter(LettaLLMRequestAdapter):
             org_id=self.org_id,
             user_id=self.user_id,
             llm_config=self.llm_config.model_dump() if self.llm_config else None,
+            billing_context=self.billing_context,
         )
         try:
             self.response_data = await self.llm_client.request_async_with_telemetry(request_data, self.llm_config)
@@ -115,8 +116,6 @@ class SimpleLLMRequestAdapter(LettaLLMRequestAdapter):
         usage = self.chat_completions_response.usage
         self.usage.cached_input_tokens, self.usage.cache_write_tokens = normalize_cache_tokens(usage.prompt_tokens_details)
         self.usage.reasoning_tokens = normalize_reasoning_tokens(usage.completion_tokens_details)
-
-        self.log_provider_trace(step_id=step_id, actor=actor)
 
         yield None
         return

@@ -19,6 +19,8 @@ from letta.errors import (
     LLMAuthenticationError,
     LLMBadRequestError,
     LLMConnectionError,
+    LLMEmptyResponseError,
+    LLMError,
     LLMInsufficientCreditsError,
     LLMNotFoundError,
     LLMPermissionDeniedError,
@@ -216,6 +218,7 @@ class AnthropicClient(LLMClientBase):
             requires_approval_tools=[],
             run_id=None,
             step_id=None,
+            llm_config=llm_config,
         )
 
         # Get the streaming response
@@ -503,6 +506,7 @@ class AnthropicClient(LLMClientBase):
         force_tool_call: Optional[str] = None,
         requires_subsequent_tool_call: bool = False,
         tool_return_truncation_chars: Optional[int] = None,
+        system: Optional[str] = None,
     ) -> dict:
         # TODO: This needs to get cleaned up. The logic here is pretty confusing.
         # TODO: I really want to get rid of prefixing, it's a recipe for disaster code maintenance wise
@@ -661,7 +665,9 @@ class AnthropicClient(LLMClientBase):
         # Move 'system' to the top level
         if messages[0].role != "system":
             raise RuntimeError(f"First message is not a system message, instead has role {messages[0].role}")
-        system_content = messages[0].content if isinstance(messages[0].content, str) else messages[0].content[0].text
+        system_content = system
+        if system_content is None:
+            system_content = messages[0].content if isinstance(messages[0].content, str) else messages[0].content[0].text
         data["system"] = self._add_cache_control_to_system_message(system_content)
         data["messages"] = PydanticMessage.to_anthropic_dicts_from_list(
             messages=messages[1:],
@@ -957,6 +963,11 @@ class AnthropicClient(LLMClientBase):
 
     @trace_method
     def handle_llm_error(self, e: Exception, llm_config: Optional[LLMConfig] = None) -> Exception:
+        # Pass through errors that are already LLMError instances unchanged
+        # This preserves specific error types like LLMEmptyResponseError
+        if isinstance(e, LLMError):
+            return e
+
         is_byok = (llm_config.provider_category == ProviderCategory.byok) if llm_config else None
 
         # make sure to check for overflow errors, regardless of error type
@@ -1028,6 +1039,7 @@ class AnthropicClient(LLMClientBase):
                 "prompt is too long" in error_str
                 or "exceed context limit" in error_str
                 or "exceeds context" in error_str
+                or "context window exceeds limit" in error_str
                 or "too many total text bytes" in error_str
                 or "total text bytes" in error_str
             ):
@@ -1087,12 +1099,14 @@ class AnthropicClient(LLMClientBase):
                     details={
                         "status_code": e.status_code if hasattr(e, "status_code") else None,
                         "transient": True,
+                        "is_byok": is_byok,
                     },
                 )
             if "overloaded" in error_str:
                 return LLMProviderOverloaded(
                     message=f"Anthropic API is overloaded: {str(e)}",
                     code=ErrorCode.INTERNAL_SERVER_ERROR,
+                    details={"is_byok": is_byok},
                 )
             logger.warning(f"[Anthropic] Internal server error: {str(e)}")
             return LLMServerError(
@@ -1101,6 +1115,7 @@ class AnthropicClient(LLMClientBase):
                 details={
                     "status_code": e.status_code if hasattr(e, "status_code") else None,
                     "response": str(e.response) if hasattr(e, "response") else None,
+                    "is_byok": is_byok,
                 },
             )
 
@@ -1278,7 +1293,7 @@ class AnthropicClient(LLMClientBase):
                 response.stop_reason,
                 json.dumps(response_data),
             )
-            raise LLMServerError(
+            raise LLMEmptyResponseError(
                 message=f"LLM provider returned empty content in response (ID: {response.id}, model: {response.model}, stop_reason: {response.stop_reason})",
                 code=ErrorCode.INTERNAL_SERVER_ERROR,
                 details={

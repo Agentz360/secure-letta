@@ -48,6 +48,7 @@ from letta.schemas.openai.chat_completion_response import (
     UsageStatisticsCompletionTokenDetails,
     UsageStatisticsPromptTokenDetails,
 )
+from letta.schemas.provider_trace import BillingContext
 from letta.schemas.step import StepProgression
 from letta.schemas.step_metrics import StepMetrics
 from letta.schemas.tool_execution_result import ToolExecutionResult
@@ -179,6 +180,7 @@ class LettaAgent(BaseAgent):
         request_start_timestamp_ns: int | None = None,
         include_return_message_types: list[MessageType] | None = None,
         dry_run: bool = False,
+        billing_context: "BillingContext | None" = None,
     ) -> Union[LettaResponse, dict]:
         # TODO (cliandy): pass in run_id and use at send_message endpoints for all step functions
         agent_state = await self.agent_manager.get_agent_by_id_async(
@@ -378,8 +380,15 @@ class LettaAgent(BaseAgent):
                             )
                         ]  # reasoning placed into content for legacy reasons
                     else:
-                        self.logger.info("No reasoning content found.")
-                        reasoning = None
+                        # Preserve thought_signature even when there's no reasoning text.
+                        # Gemini requires the signature on all function call parts in history;
+                        # dropping it causes 400 INVALID_ARGUMENT on the next request.
+                        sig = response.choices[0].message.reasoning_content_signature
+                        if sig:
+                            reasoning = [TextContent(text="", signature=sig)]
+                        else:
+                            self.logger.info("No reasoning content found.")
+                            reasoning = None
 
                     persisted_messages, should_continue, stop_reason = await self._handle_ai_response(
                         tool_call,
@@ -719,8 +728,15 @@ class LettaAgent(BaseAgent):
                     elif response.choices[0].message.omitted_reasoning_content:
                         reasoning = [OmittedReasoningContent()]
                     else:
-                        self.logger.info("No reasoning content found.")
-                        reasoning = None
+                        # Preserve thought_signature even when there's no reasoning text.
+                        # Gemini requires the signature on all function call parts in history;
+                        # dropping it causes 400 INVALID_ARGUMENT on the next request.
+                        sig = response.choices[0].message.reasoning_content_signature
+                        if sig:
+                            reasoning = [TextContent(text="", signature=sig)]
+                        else:
+                            self.logger.info("No reasoning content found.")
+                            reasoning = None
 
                     persisted_messages, should_continue, stop_reason = await self._handle_ai_response(
                         tool_call,

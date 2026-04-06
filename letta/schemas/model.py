@@ -42,6 +42,7 @@ class Model(LLMConfig, ModelBase):
         "koboldcpp",
         "vllm",
         "hugging-face",
+        "baseten",
         "minimax",
         "mistral",
         "together",
@@ -49,6 +50,7 @@ class Model(LLMConfig, ModelBase):
         "deepseek",
         "xai",
         "zai",
+        "zai_coding",
         "openrouter",
         "chatgpt_oauth",
     ] = Field(..., description="Deprecated: Use 'provider_type' field instead. The endpoint type for the model.", deprecated=True)
@@ -130,12 +132,14 @@ class Model(LLMConfig, ModelBase):
         """Returns the JSON schema for the ModelSettings class corresponding to this model's provider."""
         PROVIDER_SETTINGS_MAP = {
             ProviderType.openai: OpenAIModelSettings,
+            ProviderType.sglang: SGLangModelSettings,
             ProviderType.anthropic: AnthropicModelSettings,
             ProviderType.google_ai: GoogleAIModelSettings,
             ProviderType.google_vertex: GoogleVertexModelSettings,
             ProviderType.azure: AzureModelSettings,
             ProviderType.xai: XAIModelSettings,
             ProviderType.zai: ZAIModelSettings,
+            ProviderType.zai_coding: ZAIModelSettings,
             ProviderType.groq: GroqModelSettings,
             ProviderType.deepseek: DeepseekModelSettings,
             ProviderType.together: TogetherModelSettings,
@@ -257,6 +261,21 @@ class OpenAIModelSettings(ModelSettings):
         }
 
 
+class SGLangModelSettings(OpenAIModelSettings):
+    """SGLang model configuration (OpenAI-compatible runtime with SGLang-specific parsing)."""
+
+    provider_type: Literal[ProviderType.sglang] = Field(ProviderType.sglang, description="The type of the provider.")
+    tool_call_parser: Optional[str] = Field(
+        None,
+        description="SGLang tool call parser name (for example 'glm47', 'qwen25', or 'hermes').",
+    )
+
+    def _to_legacy_config_params(self) -> dict:
+        params = super()._to_legacy_config_params()
+        params["tool_call_parser"] = self.tool_call_parser
+        return params
+
+
 #    "thinking": {
 #        "type": "enabled",
 #        "budget_tokens": 10000
@@ -282,10 +301,10 @@ class AnthropicModelSettings(ModelSettings):
         description="Soft control for how verbose model output should be, used for GPT-5 models.",
     )
 
-    # Opus 4.5 effort parameter
-    effort: Optional[Literal["low", "medium", "high"]] = Field(
+    # Effort parameter for Opus 4.5, Opus 4.6, and Sonnet 4.6
+    effort: Optional[Literal["low", "medium", "high", "max"]] = Field(
         None,
-        description="Effort level for Opus 4.5 model (controls token conservation). Not setting this gives similar performance to 'high'.",
+        description="Effort level for supported Anthropic models (controls token spending). 'max' is only available on Opus 4.6. Not setting this gives similar performance to 'high'.",
     )
 
     # Anthropic supports strict mode for tool calling - defaults to False
@@ -513,9 +532,25 @@ class ChatGPTOAuthModelSettings(ModelSettings):
         }
 
 
+class BasetenModelSettings(ModelSettings):
+    """Baseten model configuration (OpenAI-compatible)."""
+
+    provider_type: Literal[ProviderType.baseten] = Field(ProviderType.baseten, description="The type of the provider.")
+    temperature: float = Field(0.7, description="The temperature of the model.")
+
+    def _to_legacy_config_params(self) -> dict:
+        return {
+            "temperature": self.temperature,
+            "max_tokens": self.max_output_tokens,
+            "parallel_tool_calls": self.parallel_tool_calls,
+            "strict": True,
+        }
+
+
 ModelSettingsUnion = Annotated[
     Union[
         OpenAIModelSettings,
+        SGLangModelSettings,
         AnthropicModelSettings,
         GoogleAIModelSettings,
         GoogleVertexModelSettings,
@@ -526,6 +561,7 @@ ModelSettingsUnion = Annotated[
         DeepseekModelSettings,
         TogetherModelSettings,
         BedrockModelSettings,
+        BasetenModelSettings,
         OpenRouterModelSettings,
         ChatGPTOAuthModelSettings,
     ],

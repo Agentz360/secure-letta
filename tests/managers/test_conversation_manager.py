@@ -2,6 +2,8 @@
 Tests for ConversationManager.
 """
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from letta.orm.errors import NoResultFound
@@ -198,6 +200,121 @@ async def test_delete_conversation_removes_from_list(conversation_manager, serve
 
 
 @pytest.mark.asyncio
+async def test_delete_conversation_soft_deletes_messages(conversation_manager, server: SyncServer, sarah_agent, default_user):
+    """Test that deleting a conversation soft-deletes messages by Message.conversation_id."""
+    from letta.schemas.letta_message_content import TextContent
+    from letta.schemas.message import Message as PydanticMessage
+
+    # Create conversation and verify the initial system message is stamped with the conversation ID.
+    conversation = await conversation_manager.create_conversation(
+        agent_id=sarah_agent.id,
+        conversation_create=CreateConversation(summary="Delete with messages"),
+        actor=default_user,
+    )
+
+    message_ids = await conversation_manager.get_message_ids_for_conversation(
+        conversation_id=conversation.id,
+        actor=default_user,
+    )
+    assert len(message_ids) == 1
+
+    system_message = await server.message_manager.get_message_by_id_async(message_ids[0], actor=default_user)
+    assert system_message is not None
+    assert system_message.conversation_id == conversation.id
+
+    user_message = PydanticMessage(
+        agent_id=sarah_agent.id,
+        role="user",
+        content=[TextContent(text="Message to be soft deleted")],
+        conversation_id=conversation.id,
+    )
+    created_messages = await server.message_manager.create_many_messages_async([user_message], actor=default_user)
+    user_message_id = created_messages[0].id
+
+    await conversation_manager.add_messages_to_conversation(
+        conversation_id=conversation.id,
+        agent_id=sarah_agent.id,
+        message_ids=[user_message_id],
+        actor=default_user,
+    )
+
+    # Sanity-check message is visible before delete
+    before_delete = await server.message_manager.get_message_by_id_async(user_message_id, actor=default_user)
+    assert before_delete is not None
+
+    # Delete conversation
+    await conversation_manager.delete_conversation(
+        conversation_id=conversation.id,
+        actor=default_user,
+    )
+
+    # Both system and user messages should now be hidden (soft-deleted)
+    after_delete_system = await server.message_manager.get_message_by_id_async(message_ids[0], actor=default_user)
+    after_delete = await server.message_manager.get_message_by_id_async(user_message_id, actor=default_user)
+    assert after_delete_system is None
+    assert after_delete is None
+
+
+@pytest.mark.asyncio
+async def test_delete_conversation_only_soft_deletes_messages_for_that_conversation(
+    conversation_manager, server: SyncServer, sarah_agent, default_user
+):
+    """Test deleting one conversation does not affect messages from another conversation."""
+    from letta.schemas.letta_message_content import TextContent
+    from letta.schemas.message import Message as PydanticMessage
+
+    conv1 = await conversation_manager.create_conversation(
+        agent_id=sarah_agent.id,
+        conversation_create=CreateConversation(summary="Conversation one"),
+        actor=default_user,
+    )
+    conv2 = await conversation_manager.create_conversation(
+        agent_id=sarah_agent.id,
+        conversation_create=CreateConversation(summary="Conversation two"),
+        actor=default_user,
+    )
+
+    conv1_message = PydanticMessage(
+        agent_id=sarah_agent.id,
+        role="user",
+        content=[TextContent(text="conv1 message")],
+        conversation_id=conv1.id,
+    )
+    conv2_message = PydanticMessage(
+        agent_id=sarah_agent.id,
+        role="user",
+        content=[TextContent(text="conv2 message")],
+        conversation_id=conv2.id,
+    )
+    created_messages = await server.message_manager.create_many_messages_async([conv1_message, conv2_message], actor=default_user)
+    conv1_message_id, conv2_message_id = [message.id for message in created_messages]
+
+    await conversation_manager.add_messages_to_conversation(
+        conversation_id=conv1.id,
+        agent_id=sarah_agent.id,
+        message_ids=[conv1_message_id],
+        actor=default_user,
+    )
+    await conversation_manager.add_messages_to_conversation(
+        conversation_id=conv2.id,
+        agent_id=sarah_agent.id,
+        message_ids=[conv2_message_id],
+        actor=default_user,
+    )
+
+    await conversation_manager.delete_conversation(
+        conversation_id=conv1.id,
+        actor=default_user,
+    )
+
+    assert await server.message_manager.get_message_by_id_async(conv1_message_id, actor=default_user) is None
+
+    still_visible = await server.message_manager.get_message_by_id_async(conv2_message_id, actor=default_user)
+    assert still_visible is not None
+    assert still_visible.conversation_id == conv2.id
+
+
+@pytest.mark.asyncio
 async def test_delete_conversation_double_delete_raises(conversation_manager, server: SyncServer, sarah_agent, default_user):
     """Test that deleting an already-deleted conversation raises NoResultFound."""
     created = await conversation_manager.create_conversation(
@@ -268,6 +385,58 @@ async def test_delete_conversation_excluded_from_summary_search(conversation_man
     result_ids = [c.id for c in results]
     assert to_delete.id not in result_ids
     assert len(results) == 1
+
+
+@pytest.mark.asyncio
+async def test_list_conversations_sort_by_last_message_at(conversation_manager, server: SyncServer, sarah_agent, default_user):
+    """Test sorting conversations by last_message_at with nulls last."""
+    conv_old = await conversation_manager.create_conversation(
+        agent_id=sarah_agent.id,
+        conversation_create=CreateConversation(summary="old"),
+        actor=default_user,
+    )
+    conv_new = await conversation_manager.create_conversation(
+        agent_id=sarah_agent.id,
+        conversation_create=CreateConversation(summary="new"),
+        actor=default_user,
+    )
+    conv_null = await conversation_manager.create_conversation(
+        agent_id=sarah_agent.id,
+        conversation_create=CreateConversation(summary="null"),
+        actor=default_user,
+    )
+
+    now = datetime.now(timezone.utc)
+    await conversation_manager.update_conversation(
+        conversation_id=conv_old.id,
+        conversation_update=UpdateConversation(last_message_at=now - timedelta(minutes=5)),
+        actor=default_user,
+    )
+    await conversation_manager.update_conversation(
+        conversation_id=conv_new.id,
+        conversation_update=UpdateConversation(last_message_at=now),
+        actor=default_user,
+    )
+
+    desc_conversations = await conversation_manager.list_conversations(
+        agent_id=sarah_agent.id,
+        actor=default_user,
+        sort_by="last_message_at",
+        ascending=False,
+    )
+    desc_ids = [c.id for c in desc_conversations]
+    assert desc_ids.index(conv_new.id) < desc_ids.index(conv_old.id)
+    assert desc_ids.index(conv_old.id) < desc_ids.index(conv_null.id)
+
+    asc_conversations = await conversation_manager.list_conversations(
+        agent_id=sarah_agent.id,
+        actor=default_user,
+        sort_by="last_message_at",
+        ascending=True,
+    )
+    asc_ids = [c.id for c in asc_conversations]
+    assert asc_ids.index(conv_old.id) < asc_ids.index(conv_new.id)
+    assert asc_ids.index(conv_new.id) < asc_ids.index(conv_null.id)
 
 
 @pytest.mark.asyncio
@@ -355,8 +524,9 @@ async def test_add_messages_to_conversation(
         actor=default_user,
     )
 
-    assert len(message_ids) == 1
-    assert message_ids[0] == hello_world_message_fixture.id
+    # create_conversation auto-creates a system message at position 0
+    assert len(message_ids) == 2
+    assert hello_world_message_fixture.id in message_ids
 
 
 @pytest.mark.asyncio
@@ -385,8 +555,9 @@ async def test_get_messages_for_conversation(
         actor=default_user,
     )
 
-    assert len(messages) == 1
-    assert messages[0].id == hello_world_message_fixture.id
+    # create_conversation auto-creates a system message at position 0
+    assert len(messages) == 2
+    assert any(m.id == hello_world_message_fixture.id for m in messages)
 
 
 @pytest.mark.asyncio
@@ -430,7 +601,10 @@ async def test_message_ordering_in_conversation(conversation_manager, server: Sy
         actor=default_user,
     )
 
-    assert retrieved_ids == [m.id for m in messages]
+    # create_conversation auto-creates a system message at position 0,
+    # so the user messages start at index 1
+    assert len(retrieved_ids) == len(messages) + 1
+    assert retrieved_ids[1:] == [m.id for m in messages]
 
 
 @pytest.mark.asyncio
@@ -489,7 +663,7 @@ async def test_update_in_context_messages(conversation_manager, server: SyncServ
 
 @pytest.mark.asyncio
 async def test_empty_conversation_message_ids(conversation_manager, server: SyncServer, sarah_agent, default_user):
-    """Test getting message IDs from an empty conversation."""
+    """Test getting message IDs from a newly created conversation (has auto-created system message)."""
     # Create a conversation
     conversation = await conversation_manager.create_conversation(
         agent_id=sarah_agent.id,
@@ -497,13 +671,14 @@ async def test_empty_conversation_message_ids(conversation_manager, server: Sync
         actor=default_user,
     )
 
-    # Get message IDs (should be empty)
+    # create_conversation auto-creates a system message at position 0,
+    # so a newly created conversation has exactly one message
     message_ids = await conversation_manager.get_message_ids_for_conversation(
         conversation_id=conversation.id,
         actor=default_user,
     )
 
-    assert message_ids == []
+    assert len(message_ids) == 1
 
 
 @pytest.mark.asyncio
@@ -551,9 +726,11 @@ async def test_list_conversation_messages(conversation_manager, server: SyncServ
         actor=default_user,
     )
 
-    assert len(letta_messages) == 2
+    # create_conversation auto-creates a system message, so we get 3 total
+    assert len(letta_messages) == 3
     # Check message types
     message_types = [m.message_type for m in letta_messages]
+    assert "system_message" in message_types
     assert "user_message" in message_types
     assert "assistant_message" in message_types
 
@@ -902,9 +1079,12 @@ async def test_list_conversation_messages_ascending_order(conversation_manager, 
         reverse=False,
     )
 
-    # First message should be "Message 0" (oldest)
-    assert len(letta_messages) == 3
-    assert "Message 0" in letta_messages[0].content
+    # create_conversation auto-creates a system message at position 0,
+    # so we get 4 messages total (system + 3 user messages)
+    assert len(letta_messages) == 4
+    # First message is the auto-created system message; "Message 0" is second
+    assert letta_messages[0].message_type == "system_message"
+    assert "Message 0" in letta_messages[1].content
 
 
 @pytest.mark.asyncio
@@ -949,8 +1129,9 @@ async def test_list_conversation_messages_descending_order(conversation_manager,
         reverse=True,
     )
 
-    # First message should be "Message 2" (newest)
-    assert len(letta_messages) == 3
+    # create_conversation auto-creates a system message, so 4 total
+    # First message should be "Message 2" (newest) in descending order
+    assert len(letta_messages) == 4
     assert "Message 2" in letta_messages[0].content
 
 
@@ -1081,7 +1262,8 @@ async def test_list_conversation_messages_no_group_id_returns_all(conversation_m
         actor=default_user,
     )
 
-    assert len(all_messages) == 3
+    # create_conversation auto-creates a system message, so 4 total
+    assert len(all_messages) == 4
 
 
 @pytest.mark.asyncio
@@ -1137,8 +1319,8 @@ async def test_list_conversation_messages_order_with_pagination(conversation_man
 
     # The first messages should be different
     assert page_asc[0].content != page_desc[0].content
-    # In ascending, first should be "Message 0"
-    assert "Message 0" in page_asc[0].content
+    # In ascending, first is the auto-created system message, second is "Message 0"
+    assert page_asc[0].message_type == "system_message"
     # In descending, first should be "Message 4"
     assert "Message 4" in page_desc[0].content
 
@@ -1311,3 +1493,341 @@ async def test_update_conversation_schema_model_validation():
     # Invalid format should raise
     with pytest.raises(LettaInvalidArgumentError):
         UpdateConversation(model="no-slash")
+
+
+# ======================================================================================================================
+# Fork Conversation Tests
+# ======================================================================================================================
+
+
+@pytest.mark.asyncio
+async def test_fork_conversation_basic(conversation_manager, server: SyncServer, sarah_agent, default_user):
+    """Test basic conversation forking creates a new conversation with shared messages."""
+    from letta.schemas.letta_message_content import TextContent
+    from letta.schemas.message import Message as PydanticMessage
+
+    # Create source conversation
+    source = await conversation_manager.create_conversation(
+        agent_id=sarah_agent.id,
+        conversation_create=CreateConversation(summary="Source conversation"),
+        actor=default_user,
+    )
+
+    # Add some user messages to the source conversation
+    pydantic_messages = [
+        PydanticMessage(
+            agent_id=sarah_agent.id,
+            role="user",
+            content=[TextContent(text=f"Message {i}")],
+        )
+        for i in range(3)
+    ]
+    messages = await server.message_manager.create_many_messages_async(
+        pydantic_messages,
+        actor=default_user,
+    )
+    await conversation_manager.add_messages_to_conversation(
+        conversation_id=source.id,
+        agent_id=sarah_agent.id,
+        message_ids=[m.id for m in messages],
+        actor=default_user,
+    )
+
+    # Fork the conversation
+    forked = await conversation_manager.fork_conversation(
+        conversation_id=source.id,
+        actor=default_user,
+    )
+
+    # Verify the fork has a different ID
+    assert forked.id != source.id
+    assert forked.id.startswith("conv-")
+    assert forked.agent_id == sarah_agent.id
+
+    # Get messages from both conversations
+    source_msg_ids = await conversation_manager.get_message_ids_for_conversation(
+        conversation_id=source.id,
+        actor=default_user,
+    )
+    forked_msg_ids = await conversation_manager.get_message_ids_for_conversation(
+        conversation_id=forked.id,
+        actor=default_user,
+    )
+
+    # Both should have system message + 3 user messages = 4 messages
+    assert len(source_msg_ids) == 4  # system + 3 user
+    assert len(forked_msg_ids) == 4  # new system + 3 shared user
+
+    # The user messages should be SHARED (same message IDs)
+    source_user_msgs = source_msg_ids[1:]  # skip system message
+    forked_user_msgs = forked_msg_ids[1:]  # skip system message
+    assert source_user_msgs == forked_user_msgs
+
+    # The system messages should be DIFFERENT
+    assert source_msg_ids[0] != forked_msg_ids[0]
+
+
+@pytest.mark.asyncio
+async def test_fork_conversation_new_system_message(conversation_manager, server: SyncServer, sarah_agent, default_user):
+    """Test that a forked conversation gets a newly compiled system message."""
+    # Create source conversation
+    source = await conversation_manager.create_conversation(
+        agent_id=sarah_agent.id,
+        conversation_create=CreateConversation(summary="Source"),
+        actor=default_user,
+    )
+
+    # Fork the conversation
+    forked = await conversation_manager.fork_conversation(
+        conversation_id=source.id,
+        actor=default_user,
+    )
+
+    # Get the system messages from both conversations
+    source_msgs = await conversation_manager.get_messages_for_conversation(
+        conversation_id=source.id,
+        actor=default_user,
+    )
+    forked_msgs = await conversation_manager.get_messages_for_conversation(
+        conversation_id=forked.id,
+        actor=default_user,
+    )
+
+    # Both should have at least the system message
+    assert len(source_msgs) >= 1
+    assert len(forked_msgs) >= 1
+
+    # First message in both should be system role
+    assert source_msgs[0].role == "system"
+    assert forked_msgs[0].role == "system"
+
+    # System message IDs should be different (fork gets its own)
+    assert source_msgs[0].id != forked_msgs[0].id
+
+
+@pytest.mark.asyncio
+async def test_fork_conversation_preserves_model_settings(conversation_manager, server: SyncServer, sarah_agent, default_user):
+    """Test that forking preserves model and model_settings from the source."""
+    from letta.schemas.model import OpenAIModelSettings
+
+    source = await conversation_manager.create_conversation(
+        agent_id=sarah_agent.id,
+        conversation_create=CreateConversation(
+            summary="Source with model",
+            model="openai/gpt-4o",
+            model_settings=OpenAIModelSettings(temperature=0.5),
+        ),
+        actor=default_user,
+    )
+
+    forked = await conversation_manager.fork_conversation(
+        conversation_id=source.id,
+        actor=default_user,
+    )
+
+    # Retrieve the forked conversation to verify model settings
+    retrieved = await conversation_manager.get_conversation_by_id(
+        conversation_id=forked.id,
+        actor=default_user,
+    )
+
+    assert retrieved.model == "openai/gpt-4o"
+    assert retrieved.model_settings is not None
+    assert retrieved.model_settings.temperature == 0.5
+
+
+@pytest.mark.asyncio
+async def test_fork_conversation_not_found(conversation_manager, server: SyncServer, default_user):
+    """Test that forking a non-existent conversation raises an error."""
+    from letta.orm.errors import NoResultFound
+
+    with pytest.raises(NoResultFound):
+        await conversation_manager.fork_conversation(
+            conversation_id="conv-nonexistent",
+            actor=default_user,
+        )
+
+
+@pytest.mark.asyncio
+async def test_fork_conversation_shared_messages_survive_source_delete(
+    conversation_manager, server: SyncServer, sarah_agent, default_user
+):
+    """Test that deleting the source conversation does not delete messages shared with forks."""
+    from letta.schemas.letta_message_content import TextContent
+    from letta.schemas.message import Message as PydanticMessage
+
+    # Create source conversation with messages
+    source = await conversation_manager.create_conversation(
+        agent_id=sarah_agent.id,
+        conversation_create=CreateConversation(summary="Source"),
+        actor=default_user,
+    )
+
+    user_msg = PydanticMessage(
+        agent_id=sarah_agent.id,
+        role="user",
+        content=[TextContent(text="Shared message")],
+        conversation_id=source.id,
+    )
+    created = await server.message_manager.create_many_messages_async([user_msg], actor=default_user)
+    shared_msg_id = created[0].id
+
+    await conversation_manager.add_messages_to_conversation(
+        conversation_id=source.id,
+        agent_id=sarah_agent.id,
+        message_ids=[shared_msg_id],
+        actor=default_user,
+    )
+
+    # Fork the conversation
+    forked = await conversation_manager.fork_conversation(
+        conversation_id=source.id,
+        actor=default_user,
+    )
+
+    # Delete the source conversation
+    await conversation_manager.delete_conversation(
+        conversation_id=source.id,
+        actor=default_user,
+    )
+
+    # The shared message should still be accessible since the fork references it
+    still_visible = await server.message_manager.get_message_by_id_async(shared_msg_id, actor=default_user)
+    assert still_visible is not None
+
+    # The fork should still have its messages
+    forked_msg_ids = await conversation_manager.get_message_ids_for_conversation(
+        conversation_id=forked.id,
+        actor=default_user,
+    )
+    assert shared_msg_id in forked_msg_ids
+
+
+@pytest.mark.asyncio
+async def test_fork_conversation_delete_fork_preserves_source(
+    conversation_manager, server: SyncServer, sarah_agent, default_user
+):
+    """Test that deleting a forked conversation does not affect the source."""
+    from letta.schemas.letta_message_content import TextContent
+    from letta.schemas.message import Message as PydanticMessage
+
+    # Create source conversation with messages
+    source = await conversation_manager.create_conversation(
+        agent_id=sarah_agent.id,
+        conversation_create=CreateConversation(summary="Source"),
+        actor=default_user,
+    )
+
+    user_msg = PydanticMessage(
+        agent_id=sarah_agent.id,
+        role="user",
+        content=[TextContent(text="Shared message")],
+        conversation_id=source.id,
+    )
+    created = await server.message_manager.create_many_messages_async([user_msg], actor=default_user)
+    shared_msg_id = created[0].id
+
+    await conversation_manager.add_messages_to_conversation(
+        conversation_id=source.id,
+        agent_id=sarah_agent.id,
+        message_ids=[shared_msg_id],
+        actor=default_user,
+    )
+
+    # Fork and then delete the fork
+    forked = await conversation_manager.fork_conversation(
+        conversation_id=source.id,
+        actor=default_user,
+    )
+
+    await conversation_manager.delete_conversation(
+        conversation_id=forked.id,
+        actor=default_user,
+    )
+
+    # Source messages should be unaffected
+    source_msg_ids = await conversation_manager.get_message_ids_for_conversation(
+        conversation_id=source.id,
+        actor=default_user,
+    )
+    assert shared_msg_id in source_msg_ids
+
+    # Shared message should still be visible
+    still_visible = await server.message_manager.get_message_by_id_async(shared_msg_id, actor=default_user)
+    assert still_visible is not None
+
+
+@pytest.mark.asyncio
+async def test_fork_empty_conversation(conversation_manager, server: SyncServer, sarah_agent, default_user):
+    """Test forking a conversation that only has a system message."""
+    source = await conversation_manager.create_conversation(
+        agent_id=sarah_agent.id,
+        conversation_create=CreateConversation(summary="Empty source"),
+        actor=default_user,
+    )
+
+    forked = await conversation_manager.fork_conversation(
+        conversation_id=source.id,
+        actor=default_user,
+    )
+
+    # Forked conversation should have only its own system message
+    forked_msg_ids = await conversation_manager.get_message_ids_for_conversation(
+        conversation_id=forked.id,
+        actor=default_user,
+    )
+    assert len(forked_msg_ids) == 1  # Just the new system message
+
+
+@pytest.mark.asyncio
+async def test_fork_conversation_messages_appear_in_list(conversation_manager, server: SyncServer, sarah_agent, default_user):
+    """Test that shared messages appear when listing forked conversation messages."""
+    from letta.schemas.letta_message_content import TextContent
+    from letta.schemas.message import Message as PydanticMessage
+
+    # Create source conversation with messages
+    source = await conversation_manager.create_conversation(
+        agent_id=sarah_agent.id,
+        conversation_create=CreateConversation(summary="Source"),
+        actor=default_user,
+    )
+
+    pydantic_messages = [
+        PydanticMessage(
+            agent_id=sarah_agent.id,
+            role="user",
+            content=[TextContent(text="Hello from source!")],
+        ),
+        PydanticMessage(
+            agent_id=sarah_agent.id,
+            role="assistant",
+            content=[TextContent(text="Hi there!")],
+        ),
+    ]
+    messages = await server.message_manager.create_many_messages_async(pydantic_messages, actor=default_user)
+
+    await conversation_manager.add_messages_to_conversation(
+        conversation_id=source.id,
+        agent_id=sarah_agent.id,
+        message_ids=[m.id for m in messages],
+        actor=default_user,
+    )
+
+    # Fork the conversation
+    forked = await conversation_manager.fork_conversation(
+        conversation_id=source.id,
+        actor=default_user,
+    )
+
+    # List messages in the forked conversation
+    letta_messages = await conversation_manager.list_conversation_messages(
+        conversation_id=forked.id,
+        actor=default_user,
+    )
+
+    # Should have system + user + assistant = 3 messages
+    assert len(letta_messages) == 3
+    message_types = [m.message_type for m in letta_messages]
+    assert "system_message" in message_types
+    assert "user_message" in message_types
+    assert "assistant_message" in message_types

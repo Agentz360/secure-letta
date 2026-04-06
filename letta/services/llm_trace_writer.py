@@ -73,7 +73,6 @@ class LLMTraceWriter:
     def __init__(self):
         self._client = None
         self._shutdown = False
-        self._write_lock = asyncio.Lock()  # Serialize writes - clickhouse_connect isn't thread-safe
 
         # Check if ClickHouse is configured - if not, writing is disabled
         self._enabled = bool(settings.clickhouse_endpoint and settings.clickhouse_password)
@@ -82,11 +81,7 @@ class LLMTraceWriter:
         atexit.register(self._sync_shutdown)
 
     def _get_client(self):
-        """Initialize ClickHouse client on first use (lazy loading).
-
-        Configures async_insert with wait_for_async_insert=1 for reliable
-        server-side batching with acknowledgment.
-        """
+        """Initialize ClickHouse client on first use (lazy loading)."""
         if self._client is not None:
             return self._client
 
@@ -108,8 +103,10 @@ class LLMTraceWriter:
             settings={
                 # Enable server-side batching
                 "async_insert": 1,
-                # Wait for acknowledgment (reliable)
-                "wait_for_async_insert": 1,
+                # Don't wait for server-side flush acknowledgment — fire and forget.
+                # Waiting (value=1) caused each insert to hold an asyncio.Lock for ~1s,
+                # creating unbounded task queues that saturated the event loop under load.
+                "wait_for_async_insert": 0,
                 # Flush after 1 second if batch not full
                 "async_insert_busy_timeout_ms": 1000,
             },
@@ -148,15 +145,15 @@ class LLMTraceWriter:
                 row = trace.to_clickhouse_row()
                 columns = LLMTrace.clickhouse_columns()
 
-                # Serialize writes - clickhouse_connect client isn't thread-safe
-                async with self._write_lock:
-                    # Run synchronous insert in thread pool
-                    await asyncio.to_thread(
-                        client.insert,
-                        "llm_traces",
-                        [row],
-                        column_names=columns,
-                    )
+                # Run synchronous insert in thread pool. clickhouse-connect supports
+                # multithreaded use via a thread-safe connection pool:
+                # https://clickhouse.com/docs/integrations/language-clients/python/advanced-usage#multithreaded-multiprocess-and-asyncevent-driven-use-cases
+                await asyncio.to_thread(
+                    client.insert,
+                    "llm_traces",
+                    [row],
+                    column_names=columns,
+                )
                 return  # Success
 
             except Exception as e:
@@ -165,11 +162,29 @@ class LLMTraceWriter:
                     logger.warning(f"LLMTraceWriter: Retry {attempt + 1}/{MAX_RETRIES}, backoff {backoff}s: {e}")
                     await asyncio.sleep(backoff)
                 else:
-                    logger.error(f"LLMTraceWriter: Dropping trace after {MAX_RETRIES} retries: {e}")
+                    logger.warning(
+                        "LLMTraceWriter: Dropping trace after %s retries for model=%s step_id=%s: %s",
+                        MAX_RETRIES,
+                        trace.model,
+                        trace.step_id,
+                        e,
+                    )
 
     async def shutdown_async(self) -> None:
         """Gracefully shutdown the writer."""
         self._shutdown = True
+
+        # Ensure any background write tasks complete before closing the client.
+        pending_tasks = [task for task in _background_tasks if not task.done()]
+        if pending_tasks:
+            logger.warning(
+                "LLMTraceWriter: Flushing %s pending trace write task(s) during shutdown",
+                len(pending_tasks),
+            )
+            flush_results = await asyncio.gather(*pending_tasks, return_exceptions=True)
+            for result in flush_results:
+                if isinstance(result, Exception):
+                    logger.warning(f"LLMTraceWriter: Background trace write task failed during shutdown: {result}")
 
         # Close client
         if self._client:
@@ -188,6 +203,21 @@ class LLMTraceWriter:
 
         self._shutdown = True
 
+        try:
+            asyncio.run(self.shutdown_async())
+        except Exception as e:
+            logger.warning(f"LLMTraceWriter: Async shutdown during atexit failed: {e}")
+
+            if self._client:
+                try:
+                    self._client.close()
+                except Exception as inner_error:
+                    logger.warning(f"LLMTraceWriter: Error closing client during atexit sync fallback: {inner_error}")
+                self._client = None
+        else:
+            return
+
+        # If running inside an active event loop, close only the client as a fallback.
         if self._client:
             try:
                 self._client.close()

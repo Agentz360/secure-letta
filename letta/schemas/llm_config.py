@@ -1,3 +1,4 @@
+import re
 from typing import TYPE_CHECKING, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -5,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from letta.constants import LETTA_MODEL_ENDPOINT
 from letta.errors import LettaInvalidArgumentError
 from letta.log import get_logger
+from letta.model_aliases import get_deprecated_google_handle_replacement, get_deprecated_google_model_replacement
 from letta.schemas.enums import AgentType, ProviderCategory
 from letta.schemas.response_format import ResponseFormatUnion
 
@@ -50,6 +52,9 @@ class LLMConfig(BaseModel):
         "deepseek",
         "xai",
         "zai",
+        "zai_coding",
+        "baseten",
+        "fireworks",
         "openrouter",
         "chatgpt_oauth",
     ] = Field(..., description="The endpoint type for the model.")
@@ -125,6 +130,33 @@ class LLMConfig(BaseModel):
         description="Whether to return token IDs for all LLM generations via SGLang native endpoint. "
         "Required for multi-turn RL training with loss masking. Only works with SGLang provider.",
     )
+    tool_call_parser: Optional[str] = Field(
+        None,
+        description="SGLang tool call parser name (e.g. 'glm47', 'qwen25', 'hermes'). "
+        "Used by the SGLang native adapter to parse tool calls from raw model output.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def redirect_deprecated_google_models(cls, values):
+        model = values.get("model")
+        model_endpoint_type = values.get("model_endpoint_type")
+        redirected_model = get_deprecated_google_model_replacement(model_endpoint_type=model_endpoint_type, model=model)
+
+        if redirected_model != model:
+            logger.warning(
+                "Model '%s' has been discontinued by Google; automatically using '%s' instead.",
+                model,
+                redirected_model,
+            )
+            values["model"] = redirected_model
+
+            handle = values.get("handle")
+            redirected_handle = get_deprecated_google_handle_replacement(handle)
+            if redirected_handle != handle:
+                values["handle"] = redirected_handle
+
+        return values
 
     @model_validator(mode="before")
     @classmethod
@@ -139,7 +171,9 @@ class LLMConfig(BaseModel):
 
         # Set max_tokens defaults based on model (only if not explicitly provided)
         if "max_tokens" not in values:
-            if model.startswith("gpt-5"):  # Covers both gpt-5 and gpt-5.1
+            if re.match(r"^gpt-5\.[23]", model) and "-chat" not in model:
+                values["max_tokens"] = 128000
+            elif model.startswith("gpt-5"):
                 values["max_tokens"] = 16384
             elif model == "gpt-4.1":
                 values["max_tokens"] = 8192
@@ -299,7 +333,7 @@ class LLMConfig(BaseModel):
                 context_window=272000,
                 reasoning_effort="none",  # Default to "none" for GPT-5.2
                 verbosity="medium",
-                max_tokens=16384,
+                max_tokens=128000,
             )
         elif model_name == "letta":
             return cls(
@@ -339,12 +373,23 @@ class LLMConfig(BaseModel):
             OpenAIModelSettings,
             OpenAIReasoning,
             OpenRouterModelSettings,
+            SGLangModelSettings,
             TogetherModelSettings,
             XAIModelSettings,
             ZAIModelSettings,
         )
 
         if self.model_endpoint_type == "openai":
+            handle = self.handle or ""
+            provider_name = (self.provider_name or "").lower()
+            if handle.startswith("sglang/") or "sglang" in provider_name:
+                return SGLangModelSettings(
+                    max_output_tokens=self.max_tokens or 4096,
+                    temperature=self.temperature,
+                    reasoning=OpenAIReasoning(reasoning_effort=self.reasoning_effort or "minimal"),
+                    strict=self.strict,
+                    tool_call_parser=self.tool_call_parser,
+                )
             return OpenAIModelSettings(
                 max_output_tokens=self.max_tokens or 4096,
                 temperature=self.temperature,
@@ -387,7 +432,7 @@ class LLMConfig(BaseModel):
                 max_output_tokens=self.max_tokens or 4096,
                 temperature=self.temperature,
             )
-        elif self.model_endpoint_type == "zai":
+        elif self.model_endpoint_type in ("zai", "zai_coding"):
             from letta.schemas.model import ZAIThinking
 
             thinking_type = "enabled" if self.enable_reasoner else "disabled"
@@ -426,6 +471,13 @@ class LLMConfig(BaseModel):
                 max_output_tokens=self.max_tokens or 4096,
                 temperature=self.temperature,
                 reasoning=ChatGPTOAuthReasoning(reasoning_effort=self.reasoning_effort or "medium"),
+            )
+        elif self.model_endpoint_type == "baseten":
+            from letta.schemas.model import BasetenModelSettings
+
+            return BasetenModelSettings(
+                max_output_tokens=self.max_tokens or 4096,
+                temperature=self.temperature,
             )
         elif self.model_endpoint_type == "minimax":
             # MiniMax uses Anthropic-compatible API
@@ -472,7 +524,7 @@ class LLMConfig(BaseModel):
 
     @classmethod
     def is_zai_reasoning_model(cls, config: "LLMConfig") -> bool:
-        return config.model_endpoint_type == "zai" and (
+        return config.model_endpoint_type in ("zai", "zai_coding") and (
             config.model.startswith("glm-4.5")
             or config.model.startswith("glm-4.6")
             or config.model.startswith("glm-4.7")
@@ -559,7 +611,9 @@ class LLMConfig(BaseModel):
             if cls.is_anthropic_reasoning_model(config) or is_google_reasoner_with_configurable_thinking:
                 config.enable_reasoner = bool(reasoning)
                 config.put_inner_thoughts_in_kwargs = False
-                if config.enable_reasoner and config.max_reasoning_tokens == 0:
+                # Opus 4.6 / Sonnet 4.6 use adaptive thinking (no budget_tokens), so max_reasoning_tokens is unused
+                is_adaptive_thinking_model = config.model.startswith("claude-opus-4-6") or config.model.startswith("claude-sonnet-4-6")
+                if config.enable_reasoner and config.max_reasoning_tokens == 0 and not is_adaptive_thinking_model:
                     config.max_reasoning_tokens = 1024
                 # Set default effort level for Claude Opus 4.5 and Opus 4.6
                 if (
@@ -578,6 +632,12 @@ class LLMConfig(BaseModel):
 
             # OpenRouter reasoning models: toggle honored
             if cls.is_openrouter_reasoning_model(config):
+                config.enable_reasoner = bool(reasoning)
+                config.put_inner_thoughts_in_kwargs = False
+                return config
+
+            # Baseten models: toggle honored
+            if config.model_endpoint_type == "baseten":
                 config.enable_reasoner = bool(reasoning)
                 config.put_inner_thoughts_in_kwargs = False
                 return config
@@ -632,7 +692,9 @@ class LLMConfig(BaseModel):
             config.enable_reasoner = True
             if cls.is_anthropic_reasoning_model(config):
                 config.put_inner_thoughts_in_kwargs = False
-                if config.max_reasoning_tokens == 0:
+                # Opus 4.6 / Sonnet 4.6 use adaptive thinking (no budget_tokens), so max_reasoning_tokens is unused
+                is_adaptive_thinking_model = config.model.startswith("claude-opus-4-6") or config.model.startswith("claude-sonnet-4-6")
+                if config.max_reasoning_tokens == 0 and not is_adaptive_thinking_model:
                     config.max_reasoning_tokens = 1024
                 # Set default effort level for Claude Opus 4.5 and Opus 4.6
                 if (
